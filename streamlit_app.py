@@ -5,6 +5,8 @@ Fase 2, primera entrega: stock del hogar.
   - Pedido de la semana: la familia arma una lista, quien está en la casa
     contesta artículo por artículo, y sale la lista de compras final.
   - Faltantes: todo lo que está en "Queda poco" o "Falta".
+  - Resumen del año: ingreso, gasto y ahorro por mes, con el gasto por grupo.
+  - Importar: carga el ledger del sistema de la carpeta Finanzas (solo administrador).
   - Revisar artículos: aprobar lo que se propuso desde la pantalla de stock.
   - Estado: control de conexión y de tablas (solo administrador).
 Qué ve cada persona lo decide la base de datos según su rol, no esta pantalla.
@@ -58,7 +60,7 @@ if st.session_state.usuario is None:
     with st.form("ingreso"):
         correo = st.text_input("Correo")
         clave = st.text_input("Contraseña", type="password")
-        entrar = st.form_submit_button("Entrar", use_container_width=True)
+        entrar = st.form_submit_button("Entrar", width="stretch")
     if entrar:
         try:
             cliente.auth.sign_in_with_password({"email": correo.strip(), "password": clave})
@@ -172,7 +174,7 @@ def pantalla_stock():
         with st.form("proponer", clear_on_submit=True):
             nombre = st.text_input("Nombre del artículo")
             lugar = st.selectbox("Lugar de la casa", nombres)
-            enviar = st.form_submit_button("Agregar", use_container_width=True)
+            enviar = st.form_submit_button("Agregar", width="stretch")
         if enviar:
             nombre = " ".join(nombre.split())
             if not nombre:
@@ -269,7 +271,7 @@ def pantalla_pedido():
             st.info("No hay ningún pedido para revisar.")
             return
         st.info("No hay un pedido abierto.")
-        if st.button("Empezar el pedido de la semana", use_container_width=True):
+        if st.button("Empezar el pedido de la semana", width="stretch"):
             pedir(lambda: cliente.table("stock_consultas").insert({"estado": "armando"}).execute())
             st.rerun()
         return
@@ -299,7 +301,7 @@ def pantalla_pedido():
                 format_func=lambda a: a["nombre"],
             )
             cantidad = st.text_input("Cantidad o aclaración (opcional)", placeholder="2 cajas, la marca de siempre…")
-            if st.form_submit_button("Agregar al pedido", use_container_width=True):
+            if st.form_submit_button("Agregar al pedido", width="stretch"):
                 if elegido is None:
                     st.warning("Elegí un artículo.")
                 else:
@@ -315,7 +317,7 @@ def pantalla_pedido():
                 nombre = st.text_input("Nombre del artículo")
                 lugar = st.selectbox("Lugar de la casa", [g["nombre"] for g in grupos])
                 cant2 = st.text_input("Cantidad o aclaración (opcional)")
-                if st.form_submit_button("Crear y agregar", use_container_width=True):
+                if st.form_submit_button("Crear y agregar", width="stretch"):
                     nombre = " ".join(nombre.split())
                     existente = next((a for a in articulos if a["nombre"].lower() == nombre.lower()), None)
                     if not nombre:
@@ -346,7 +348,7 @@ def pantalla_pedido():
             if st.checkbox(f"Quitar: {texto}", key=f"quitar_{i['id']}"):
                 pedir(lambda: cliente.table("stock_consulta_items").delete().eq("id", i["id"]).execute())
                 st.rerun()
-        if items and st.button("Enviar a revisar", type="primary", use_container_width=True):
+        if items and st.button("Enviar a revisar", type="primary", width="stretch"):
             pedir(lambda: cliente.table("stock_consultas").update({"estado": "enviada"}).eq("id", pedido["id"]).execute())
             st.rerun()
         return
@@ -372,7 +374,7 @@ def pantalla_pedido():
     lista_final(items, nombre_de)
     if familia:
         st.divider()
-        if st.button("Cerrar este pedido", use_container_width=True):
+        if st.button("Cerrar este pedido", width="stretch"):
             pedir(lambda: cliente.table("stock_consultas").update({"estado": "cerrada"}).eq("id", pedido["id"]).execute())
             st.rerun()
 
@@ -404,6 +406,137 @@ def pantalla_revisar():
             st.rerun()
 
 
+def gs(n) -> str:
+    """Guaraníes con separador de miles."""
+    return f"{int(round(n)):,}".replace(",", ".")
+
+
+def pantalla_resumen():
+    filas = pedir(lambda: cliente.table("v_resultado_mensual").select("*").order("mes").execute().data)
+    if not filas:
+        st.info("Todavía no hay movimientos cargados.")
+        return
+    st.caption(
+        "Fondo común del hogar: lo que pasa por las cuentas cargadas. "
+        "No incluye lo que Sofía cobra y paga desde sus propias cuentas."
+    )
+    tabla = [
+        {
+            "Mes": f["mes"][:7],
+            "Ingreso": gs(f["ingreso"]),
+            "Gasto": gs(f["gasto"]),
+            "Ahorro": gs(f["ahorro"]),
+            "Tasa de ahorro": "" if f["tasa_ahorro_pct"] is None else f"{float(f['tasa_ahorro_pct']):.1f} %",
+        }
+        for f in filas
+    ]
+    st.dataframe(tabla, hide_index=True, width="stretch")
+
+    meses = [f["mes"][:7] for f in filas]
+    mes = st.selectbox("Detalle del gasto de", meses, index=len(meses) - 1)
+    detalle = pedir(
+        lambda: cliente.table("v_gasto_por_grupo").select("*").eq("mes", f"{mes}-01").execute().data
+    )
+    por_grupo = {}
+    for d in detalle:
+        por_grupo.setdefault(d["grupo"], []).append(d)
+    total = sum(d["gasto"] for d in detalle) or 1
+    for grupo, items in sorted(por_grupo.items(), key=lambda kv: -sum(i["gasto"] for i in kv[1])):
+        subtotal = sum(i["gasto"] for i in items)
+        with st.expander(f"{grupo} — {gs(subtotal)}  ({100 * subtotal / total:.0f} %)"):
+            for i in sorted(items, key=lambda i: -i["gasto"]):
+                st.write(f"- {i['categoria']}: {gs(i['gasto'])}  ·  {i['movimientos']} mov.")
+
+
+COLUMNAS_LEDGER = [
+    "id_tx", "fecha", "fecha_caja", "mes", "fuente", "cuenta", "flujo", "flujo_origen", "importe",
+    "categoria", "subcategoria", "contraparte", "descripcion_raw", "transferencia_interna", "compra_id",
+    "cuota_n", "cuota_total", "estado", "fecha_cobro", "archivo_origen", "ambito", "capital",
+    "interes_deuda", "tipo_gasto",
+]
+
+
+def pantalla_importar():
+    import csv
+    import io
+
+    st.caption(
+        "Carga el ledger del sistema de la carpeta Finanzas (sistema/data/ledger.csv). "
+        "Se puede repetir cada mes: no duplica movimientos ni pisa lo corregido en la app."
+    )
+    archivo = st.file_uploader("Archivo ledger.csv", type=["csv"])
+    if archivo is None:
+        return
+    try:
+        lector = csv.DictReader(io.StringIO(archivo.getvalue().decode("utf-8-sig")))
+        filas = [{c: (f.get(c) or "") for c in COLUMNAS_LEDGER} for f in lector]
+        faltan = [c for c in COLUMNAS_LEDGER if c not in (lector.fieldnames or [])]
+    except Exception as e:  # noqa: BLE001
+        st.error(f"No se pudo leer el archivo ({type(e).__name__}).")
+        return
+    if faltan:
+        st.error("El archivo no es el ledger esperado. Faltan columnas: " + ", ".join(faltan))
+        return
+    if not filas:
+        st.error("El archivo no tiene movimientos.")
+        return
+    meses = sorted({f["mes"] for f in filas})
+    st.write(f"{gs(len(filas))} movimientos, de {meses[0]} a {meses[-1]}.")
+
+    if not st.button("Cargar en la base", type="primary", width="stretch"):
+        return
+
+    barra = st.progress(0.0, text="Reemplazando la copia del ledger…")
+    pedir(lambda: cliente.table("ledger_importado").delete().neq("id_tx", "").execute())
+    paso = 400
+    for i in range(0, len(filas), paso):
+        lote = filas[i : i + paso]
+        pedir(lambda: cliente.table("ledger_importado").upsert(lote, on_conflict="id_tx").execute())
+        barra.progress(min(1.0, (i + paso) / len(filas)), text=f"Subiendo movimientos… {min(i + paso, len(filas))} de {len(filas)}")
+    barra.progress(1.0, text="Repartiendo en las tablas de la app…")
+    resultado = pedir(lambda: cliente.rpc("migrar_ledger").execute().data)
+    barra.empty()
+
+    st.success(
+        f"Migración hecha: {gs(resultado['egresos'])} egresos, {gs(resultado['ingresos'])} ingresos, "
+        f"{gs(resultado['traspasos'])} traspasos y {gs(resultado['operaciones_patrimoniales'])} operaciones patrimoniales."
+    )
+    avisos = {
+        "omitidos_importe_cero": "movimientos con importe cero, omitidos",
+        "egresos_sin_cuenta": "egresos de una cuenta que la app no conoce, no cargados",
+        "sin_categoria": "movimientos con una categoría que la app no conoce, cargados sin categoría",
+        "ya_no_estan_en_el_ledger": "movimientos que están en la app y ya no figuran en el ledger",
+    }
+    for clave, texto in avisos.items():
+        if resultado.get(clave):
+            st.warning(f"{resultado[clave]} {texto}.")
+
+    # Control: los totales por mes de la app tienen que coincidir con los del ledger
+    del_ledger = {}
+    for f in filas:
+        if f["flujo"] in ("ingreso", "egreso"):
+            m = del_ledger.setdefault(f["mes"], {"ingreso": 0.0, "egreso": 0.0})
+            m[f["flujo"]] += float(f["importe"] or 0)
+    en_app = {
+        r["mes"][:7]: r
+        for r in pedir(lambda: cliente.table("v_resultado_mensual").select("*").execute().data)
+    }
+    control, descuadres = [], 0
+    for mes in sorted(del_ledger):
+        a = en_app.get(mes, {"ingreso": 0, "gasto": 0})
+        di = round(del_ledger[mes]["ingreso"]) - a["ingreso"]
+        dg = round(del_ledger[mes]["egreso"]) - a["gasto"]
+        descuadres += bool(di or dg)
+        control.append({"Mes": mes, "Ingreso (ledger)": gs(del_ledger[mes]["ingreso"]), "Ingreso (app)": gs(a["ingreso"]),
+                        "Gasto (ledger)": gs(del_ledger[mes]["egreso"]), "Gasto (app)": gs(a["gasto"]),
+                        "Diferencia": gs(abs(di) + abs(dg))})
+    if descuadres:
+        st.error(f"{descuadres} mes(es) no coinciden con el ledger. Revisar antes de usar las cifras.")
+    else:
+        st.success(f"Control: los {len(control)} meses coinciden con el ledger, en ingreso y en gasto.")
+    st.dataframe(control, hide_index=True, width="stretch")
+
+
 def pantalla_estado():
     try:
         r = requests.get(f"{URL}/auth/v1/settings", headers={"apikey": KEY}, timeout=10)
@@ -424,7 +557,9 @@ PANTALLAS = {"Stock": pantalla_stock, "Pedido de la semana": pantalla_pedido}
 if rol in ("admin", "familia"):
     PANTALLAS["Faltantes"] = pantalla_lista
     PANTALLAS["Revisar artículos"] = pantalla_revisar
+    PANTALLAS["Resumen del año"] = pantalla_resumen
 if rol == "admin":
+    PANTALLAS["Importar"] = pantalla_importar
     PANTALLAS["Estado"] = pantalla_estado
 
 # Quien revisa la casa arranca en el pedido si hay uno esperando respuesta
