@@ -1,13 +1,14 @@
 """App del hogar.
 
-Fase 2, primera entrega: stock del hogar.
-  - Stock: cada artículo se marca como "Hay", "Queda poco" o "Falta".
-  - Pedido de la semana: la familia arma una lista, quien está en la casa
-    contesta artículo por artículo, y sale la lista de compras final.
-  - Faltantes: todo lo que está en "Queda poco" o "Falta".
+Stock del hogar
+  - Stock: quien está en la casa marca cada artículo como "Hay", "Queda poco"
+    o "Falta", cuando quiere.
+  - Faltantes: la familia ve lo marcado y decide qué se compra.
+  - Lista de compras: lo decidido, a la vista de todos.
+  - Revisar artículos: aprobar lo que se propuso desde la pantalla de stock.
+Finanzas
   - Resumen del año: ingreso, gasto y ahorro por mes, con el gasto por grupo.
   - Importar: carga el ledger del sistema de la carpeta Finanzas (solo administrador).
-  - Revisar artículos: aprobar lo que se propuso desde la pantalla de stock.
   - Estado: control de conexión y de tablas (solo administrador).
 Qué ve cada persona lo decide la base de datos según su rol, no esta pantalla.
 """
@@ -195,188 +196,103 @@ def pantalla_stock():
                     st.rerun()
 
 
-def pantalla_lista():
+DECISION = {"comprar": "Comprar", "no_por_ahora": "Por ahora no"}
+CLAVE_DECISION = {v: k for k, v in DECISION.items()}
+
+
+def al_decidir(reporte_id: int):
+    elegido = st.session_state.get(f"dec_{reporte_id}")
+    valor = CLAVE_DECISION[elegido] if elegido else None  # desmarcar = volver a "sin decidir"
+    try:
+        pedir(lambda: cliente.table("stock_reportes").update({"decision": valor}).eq("id", reporte_id).execute())
+    except Exception as e:  # noqa: BLE001
+        st.session_state.aviso = f"No se pudo guardar la decisión ({type(e).__name__}). Probá de nuevo."
+
+
+def al_anotar(reporte_id: int):
+    texto = (st.session_state.get(f"cant_{reporte_id}") or "").strip()
+    try:
+        pedir(lambda: cliente.table("stock_reportes").update({"cantidad": texto or None}).eq("id", reporte_id).execute())
+    except Exception as e:  # noqa: BLE001
+        st.session_state.aviso = f"No se pudo guardar la cantidad ({type(e).__name__}). Probá de nuevo."
+
+
+def leer_faltantes():
     filas = pedir(lambda: cliente.table("v_lista_compras").select("*").order("orden").execute().data)
+    return sorted(filas, key=lambda x: (x["orden"], x["estado"] != "falta", x["articulo"]))
+
+
+def pantalla_faltantes():
+    """La familia mira lo que falta o queda poco y decide qué se compra."""
+    filas = leer_faltantes()
+    if st.session_state.get("aviso"):
+        st.error(st.session_state.pop("aviso"))
     if not filas:
-        st.success("No hay nada para reponer.")
+        st.success("No hay nada marcado como faltante ni por acabarse.")
         return
-    st.caption(f"{len(filas)} artículo(s) para reponer. Tildá lo que ya se compró.")
-    texto = []
+    sin_decidir = sum(1 for f in filas if not f.get("decision"))
+    a_comprar = sum(1 for f in filas if f.get("decision") == "comprar")
+    st.caption(f"{len(filas)} artículo(s) marcados · Sin decidir: {sin_decidir} · A comprar: {a_comprar}")
+
+    ver = st.segmented_control("Mostrar", ["Sin decidir", "Todos"], default="Sin decidir", key="ver_faltantes", label_visibility="collapsed")
+    if ver != "Todos":
+        visibles = [f for f in filas if not f.get("decision")]
+        if not visibles:
+            st.success("Todo decidido. La lista de compras está en la sección «Lista de compras».")
+    else:
+        visibles = filas
+
     grupo = None
-    for f in sorted(filas, key=lambda x: (x["orden"], x["estado"] != "falta", x["articulo"])):
+    for f in visibles:
+        if f["grupo"] != grupo:
+            grupo = f["grupo"]
+            st.markdown(f"**{grupo}**")
+        marca = "FALTA" if f["estado"] == "falta" else "queda poco"
+        llave = f"dec_{f['reporte_id']}"
+        st.session_state[llave] = DECISION.get(f.get("decision"))
+        st.segmented_control(
+            f"{f['articulo']} — {marca}", list(DECISION.values()), key=llave,
+            on_change=al_decidir, args=(f["reporte_id"],),
+        )
+        if f.get("decision") == "comprar":
+            llave_c = f"cant_{f['reporte_id']}"
+            st.session_state[llave_c] = f.get("cantidad") or ""
+            st.text_input(
+                "Cantidad o aclaración", key=llave_c, placeholder="Cantidad o aclaración (opcional)",
+                label_visibility="collapsed", on_change=al_anotar, args=(f["reporte_id"],),
+            )
+
+
+def pantalla_lista():
+    """Lista de compras: lo que la familia decidió comprar. La ven todos."""
+    filas = [f for f in leer_faltantes() if f.get("decision") == "comprar"]
+    if st.session_state.get("aviso"):
+        st.error(st.session_state.pop("aviso"))
+    if not filas:
+        st.info("Todavía no hay nada decidido para comprar.")
+        return
+    familia = rol in ("admin", "familia")
+    st.caption(
+        f"{len(filas)} artículo(s) para comprar."
+        + (" Tildá lo que ya se compró." if familia else " Cuando llegue la compra, marcá «Hay» en Stock.")
+    )
+    texto = ["Lista de compras"]
+    grupo = None
+    for f in filas:
         if f["grupo"] != grupo:
             grupo = f["grupo"]
             st.markdown(f"**{grupo}**")
             texto.append(f"\n{grupo}")
-        marca = "FALTA" if f["estado"] == "falta" else "queda poco"
-        detalle = " · ".join(x for x in [f.get("presentacion"), f.get("marca_preferida")] if x)
-        etiqueta = f"{f['articulo']} — {marca}" + (f"  ({detalle})" if detalle else "")
-        texto.append(f"- {f['articulo']} ({marca})")
-        if st.checkbox(etiqueta, key=f"rep_{f['reporte_id']}"):
-            pedir(lambda: cliente.table("stock_reportes").update({"repuesto_en": ahora()}).eq("id", f["reporte_id"]).execute())
-            st.rerun()
-    with st.expander("Lista en texto, para copiar y enviar"):
-        st.code("Lista de compras" + "\n".join(texto), language=None)
-
-
-def pedido_abierto():
-    filas = pedir(lambda: cliente.table("stock_consultas").select("*").neq("estado", "cerrada").execute().data)
-    return filas[0] if filas else None
-
-
-def al_responder(item_id: int):
-    elegido = st.session_state.get(f"resp_{item_id}")
-    if elegido is None:
-        return
-    try:
-        pedir(lambda: cliente.table("stock_consulta_items").update({"respuesta": CLAVE[elegido]}).eq("id", item_id).execute())
-    except Exception as e:  # noqa: BLE001
-        st.session_state.aviso = f"No se pudo guardar la respuesta ({type(e).__name__}). Probá de nuevo."
-
-
-def lista_final(items, nombre_de):
-    """Lista de compras que sale del pedido contestado."""
-    bloques = [
-        ("Comprar: falta", "falta"),
-        ("Comprar si conviene: queda poco", "queda_poco"),
-        ("Sin contestar todavía", None),
-        ("No hace falta: hay", "hay"),
-    ]
-    texto = ["Lista de compras de la semana"]
-    for titulo, clave in bloques:
-        grupo = sorted((i for i in items if i["respuesta"] == clave), key=lambda i: nombre_de(i))
-        if not grupo:
-            continue
-        st.markdown(f"**{titulo}**")
-        if clave in ("falta", "queda_poco"):
-            texto.append(f"\n{titulo}")
-        for i in grupo:
-            linea = nombre_de(i) + (f" — {i['cantidad']}" if i.get("cantidad") else "")
+        linea = f["articulo"] + (f" — {f['cantidad']}" if f.get("cantidad") else "")
+        texto.append(f"- {linea}")
+        if familia:
+            if st.checkbox(linea, key=f"rep_{f['reporte_id']}"):
+                pedir(lambda: cliente.table("stock_reportes").update({"repuesto_en": ahora()}).eq("id", f["reporte_id"]).execute())
+                st.rerun()
+        else:
             st.write(f"- {linea}")
-            if clave in ("falta", "queda_poco"):
-                texto.append(f"- {linea}")
     with st.expander("Lista en texto, para copiar y enviar"):
         st.code("\n".join(texto), language=None)
-
-
-def pantalla_pedido():
-    familia = rol in ("admin", "familia")
-    pedido = pedido_abierto()
-
-    if st.session_state.get("aviso"):
-        st.error(st.session_state.pop("aviso"))
-
-    if pedido is None:
-        if not familia:
-            st.info("No hay ningún pedido para revisar.")
-            return
-        st.info("No hay un pedido abierto.")
-        if st.button("Empezar el pedido de la semana", width="stretch"):
-            pedir(lambda: cliente.table("stock_consultas").insert({"estado": "armando"}).execute())
-            st.rerun()
-        return
-
-    grupos, articulos, _ = leer_stock()
-    por_id = {a["id"]: a for a in articulos}
-    items = pedir(
-        lambda: cliente.table("stock_consulta_items")
-        .select("id, articulo_id, cantidad, respuesta")
-        .eq("consulta_id", pedido["id"])
-        .execute()
-        .data
-    )
-
-    def nombre_de(i):
-        a = por_id.get(i["articulo_id"])
-        return a["nombre"] if a else "(artículo no visible)"
-
-    # ---- armando: solo la familia
-    if pedido["estado"] == "armando":
-        st.subheader("Armar el pedido")
-        ya = {i["articulo_id"] for i in items}
-        libres = sorted((a for a in articulos if a["id"] not in ya), key=lambda a: a["nombre"])
-        with st.form("agregar_item", clear_on_submit=True):
-            elegido = st.selectbox(
-                "Artículo", libres, index=None, placeholder="Escribí para buscar…",
-                format_func=lambda a: a["nombre"],
-            )
-            cantidad = st.text_input("Cantidad o aclaración (opcional)", placeholder="2 cajas, la marca de siempre…")
-            if st.form_submit_button("Agregar al pedido", width="stretch"):
-                if elegido is None:
-                    st.warning("Elegí un artículo.")
-                else:
-                    pedir(
-                        lambda: cliente.table("stock_consulta_items")
-                        .insert({"consulta_id": pedido["id"], "articulo_id": elegido["id"], "cantidad": cantidad.strip() or None})
-                        .execute()
-                    )
-                    st.rerun()
-
-        with st.expander("Agregar algo que no está en el catálogo"):
-            with st.form("item_nuevo", clear_on_submit=True):
-                nombre = st.text_input("Nombre del artículo")
-                lugar = st.selectbox("Lugar de la casa", [g["nombre"] for g in grupos])
-                cant2 = st.text_input("Cantidad o aclaración (opcional)")
-                if st.form_submit_button("Crear y agregar", width="stretch"):
-                    nombre = " ".join(nombre.split())
-                    existente = next((a for a in articulos if a["nombre"].lower() == nombre.lower()), None)
-                    if not nombre:
-                        st.warning("Escribí el nombre del artículo.")
-                    elif existente and existente["id"] in ya:
-                        st.warning("Ese artículo ya está en el pedido.")
-                    else:
-                        if existente:
-                            art_id = existente["id"]
-                        else:
-                            grupo_id = next(g["id"] for g in grupos if g["nombre"] == lugar)
-                            art_id = pedir(
-                                lambda: cliente.table("stock_articulos")
-                                .insert({"nombre": nombre, "grupo_id": grupo_id, "pendiente_revision": False})
-                                .execute()
-                                .data
-                            )[0]["id"]
-                        pedir(
-                            lambda: cliente.table("stock_consulta_items")
-                            .insert({"consulta_id": pedido["id"], "articulo_id": art_id, "cantidad": cant2.strip() or None})
-                            .execute()
-                        )
-                        st.rerun()
-
-        st.markdown(f"**En el pedido: {len(items)}**")
-        for i in sorted(items, key=nombre_de):
-            texto = nombre_de(i) + (f" — {i['cantidad']}" if i.get("cantidad") else "")
-            if st.checkbox(f"Quitar: {texto}", key=f"quitar_{i['id']}"):
-                pedir(lambda: cliente.table("stock_consulta_items").delete().eq("id", i["id"]).execute())
-                st.rerun()
-        if items and st.button("Enviar a revisar", type="primary", width="stretch"):
-            pedir(lambda: cliente.table("stock_consultas").update({"estado": "enviada"}).eq("id", pedido["id"]).execute())
-            st.rerun()
-        return
-
-    # ---- enviada: se contesta artículo por artículo
-    if pedido["estado"] == "enviada":
-        contestados = sum(1 for i in items if i["respuesta"])
-        st.subheader("Revisión de la semana")
-        st.caption(f"Contestados: {contestados} de {len(items)}. Marcá cada artículo según lo que hay en la casa.")
-        for i in sorted(items, key=lambda i: (i["respuesta"] is not None, nombre_de(i))):
-            llave = f"resp_{i['id']}"
-            st.session_state[llave] = ETIQUETA[i["respuesta"]] if i["respuesta"] else None
-            titulo = nombre_de(i) + (f" — {i['cantidad']}" if i.get("cantidad") else "")
-            st.segmented_control(titulo, list(ETIQUETA.values()), key=llave, on_change=al_responder, args=(i["id"],))
-        if familia and contestados:
-            st.divider()
-            st.markdown("**Cómo viene la lista**")
-            lista_final(items, nombre_de)
-        return
-
-    # ---- respondida: lista final a la vista de todos
-    st.subheader("Lista de compras de la semana")
-    lista_final(items, nombre_de)
-    if familia:
-        st.divider()
-        if st.button("Cerrar este pedido", width="stretch"):
-            pedir(lambda: cliente.table("stock_consultas").update({"estado": "cerrada"}).eq("id", pedido["id"]).execute())
-            st.rerun()
 
 
 def pantalla_revisar():
@@ -553,28 +469,20 @@ def pantalla_estado():
 
 
 # ---------------------------------------------------------------- navegación
-PANTALLAS = {"Stock": pantalla_stock, "Pedido de la semana": pantalla_pedido}
+PANTALLAS = {"Stock": pantalla_stock}
 if rol in ("admin", "familia"):
-    PANTALLAS["Faltantes"] = pantalla_lista
+    PANTALLAS["Faltantes"] = pantalla_faltantes
+PANTALLAS["Lista de compras"] = pantalla_lista
+if rol in ("admin", "familia"):
     PANTALLAS["Revisar artículos"] = pantalla_revisar
     PANTALLAS["Resumen del año"] = pantalla_resumen
 if rol == "admin":
     PANTALLAS["Importar"] = pantalla_importar
     PANTALLAS["Estado"] = pantalla_estado
 
-# Quien revisa la casa arranca en el pedido si hay uno esperando respuesta
-inicio = "Stock"
-if rol == "hogar" and "seccion" not in st.session_state:
-    try:
-        p = pedido_abierto()
-        if p and p["estado"] == "enviada":
-            inicio = "Pedido de la semana"
-    except Exception:  # noqa: BLE001
-        pass
-
 st.title("Hogar")
-seccion = st.segmented_control("Sección", list(PANTALLAS), default=inicio, key="seccion", label_visibility="collapsed")
-seccion = seccion or inicio
+seccion = st.segmented_control("Sección", list(PANTALLAS), default="Stock", key="seccion", label_visibility="collapsed")
+seccion = seccion or "Stock"
 
 PANTALLAS[seccion]()
 
