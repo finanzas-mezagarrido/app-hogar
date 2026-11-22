@@ -7,12 +7,14 @@ Stock del hogar
   - Lista de compras: lo decidido, a la vista de todos.
   - Revisar artículos: aprobar lo que se propuso desde la pantalla de stock.
 Finanzas
+  - Pendientes: clasificar gastos e identificar ingresos que el sistema no reconoció.
   - Resumen del año: ingreso, gasto y ahorro por mes, con el gasto por grupo.
   - Importar: carga el ledger del sistema de la carpeta Finanzas (solo administrador).
   - Estado: control de conexión y de tablas (solo administrador).
 Qué ve cada persona lo decide la base de datos según su rol, no esta pantalla.
 """
 import datetime as dt
+import re
 
 import requests
 import streamlit as st
@@ -327,6 +329,212 @@ def gs(n) -> str:
     return f"{int(round(n)):,}".replace(",", ".")
 
 
+# ----------------------------------------------------------------------------
+# Pendientes: clasificar egresos e identificar ingresos
+# ----------------------------------------------------------------------------
+NO_ES_GASTO = "No es un gasto (traspaso propio, obra, préstamo…)"
+NO_ES_INGRESO = "No es un ingreso (traspaso propio, devolución, préstamo…)"
+CATEGORIAS_DE_ESPERA = ("Sin clasificar", "Transferencia enviada", "Cobro por identificar")
+
+
+def clave_comercio(texto) -> str:
+    """Nombre del comercio sin fechas ni números, para juntar sus compras."""
+    t = (texto or "").upper()
+    t = re.sub(r"\d{2}/\d{2}(/\d{2,4})?", " ", t)
+    t = re.sub(r"\b\d[\d.,\-/]*\b", " ", t)
+    t = re.sub(r"[^A-ZÁÉÍÓÚÑ&. ]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()[:40] or "(sin descripción)"
+
+
+def fecha_corta(f) -> str:
+    f = str(f or "")
+    return f"{f[8:10]}/{f[5:7]}/{f[:4]}" if len(f) >= 10 else f
+
+
+def leer_pendientes():
+    cats = pedir(lambda: cliente.table("categorias").select("id,nombre,flujo,activa").order("nombre").execute().data)
+    cuentas = {c["id"]: c["nombre"] for c in pedir(lambda: cliente.table("cuentas").select("id,nombre").execute().data)}
+    egresos = pedir(lambda: cliente.table("egresos").select(
+        "id,fecha_operacion,importe,texto_extracto,cuenta_id,categoria_id,notas,revision"
+    ).eq("estado", "sin_clasificar").execute().data)
+    ingresos = pedir(lambda: cliente.table("ingresos").select(
+        "id,fecha_cobro,importe,texto_extracto,cuenta_id,categoria_id,notas,revision"
+    ).eq("estado", "por_identificar").execute().data)
+    return cats, cuentas, egresos, ingresos
+
+
+def aplicar_clasificacion(tabla: str, llave: str, ids: list, llave_nota=None):
+    """Guarda la categoría elegida para uno o varios movimientos."""
+    elegido = st.session_state.get(llave)
+    if not elegido:
+        return
+    nota = (st.session_state.get(llave_nota) or "").strip() if llave_nota else ""
+    mapa = st.session_state.get("mapa_categorias", {}).get(tabla, {})
+    try:
+        if elegido in (NO_ES_GASTO, NO_ES_INGRESO):
+            pedir(lambda: cliente.rpc("marcar_no_corresponde", {"p_tabla": tabla, "p_ids": ids, "p_nota": nota or None}).execute())
+            st.session_state.hecho = f"{len(ids)} movimiento(s) marcados para revisar."
+        else:
+            funcion = "clasificar_egresos" if tabla == "egresos" else "identificar_ingresos"
+            pedir(lambda: cliente.rpc(funcion, {"p_ids": ids, "p_categoria": mapa[elegido], "p_nota": nota or None}).execute())
+            st.session_state.hecho = f"{len(ids)} movimiento(s) → {elegido}."
+    except Exception as e:  # noqa: BLE001
+        st.session_state.aviso = f"No se pudo guardar ({type(e).__name__}). Probá de nuevo."
+
+
+def deshacer_marca(tabla: str, mov_id: int):
+    try:
+        pedir(lambda: cliente.rpc("marcar_no_corresponde", {"p_tabla": tabla, "p_ids": [mov_id], "p_nota": None, "p_deshacer": True}).execute())
+    except Exception as e:  # noqa: BLE001
+        st.session_state.aviso = f"No se pudo deshacer ({type(e).__name__})."
+
+
+def ver_mas(llave: str, total: int, paso: int) -> int:
+    """Cuántos elementos mostrar, con un botón para ampliar."""
+    hasta = st.session_state.get(llave, paso)
+    return min(hasta, total)
+
+
+def boton_ver_mas(llave: str, mostrados: int, total: int, paso: int):
+    if mostrados < total and st.button(f"Ver más ({total - mostrados} restantes)", key=f"btn_{llave}", width="stretch"):
+        st.session_state[llave] = mostrados + paso
+        st.rerun()
+
+
+def lista_uno_por_uno(tabla: str, filas: list, cuentas: dict, opciones: list, campo_fecha: str, prefijo: str):
+    """Movimientos sin nombre de comercio: se resuelven de a uno."""
+    meses = sorted({str(f[campo_fecha])[:7] for f in filas}, reverse=True)
+    mes = st.selectbox("Mes", ["Todos"] + meses, key=f"mes_{prefijo}")
+    if mes != "Todos":
+        filas = [f for f in filas if str(f[campo_fecha])[:7] == mes]
+    filas = sorted(filas, key=lambda f: -f["importe"])
+    st.caption(f"{len(filas)} movimiento(s) · Gs {gs(sum(f['importe'] for f in filas))}. Ordenados de mayor a menor.")
+    llave_pag = f"pag_{prefijo}_{mes}"
+    n = ver_mas(llave_pag, len(filas), 20)
+    for f in filas[:n]:
+        with st.container(border=True):
+            st.markdown(f"**Gs {gs(f['importe'])}** · {fecha_corta(f[campo_fecha])} · {cuentas.get(f['cuenta_id'], 'Sin cuenta')}")
+            st.caption(f.get("texto_extracto") or "Sin descripción del banco")
+            llave_nota = f"nota_{prefijo}_{f['id']}"
+            llave = f"cat_{prefijo}_{f['id']}"
+            a, b = st.columns(2)
+            a.text_input("Nota", key=llave_nota, placeholder="A quién o para qué (opcional)", label_visibility="collapsed")
+            b.selectbox("Categoría", opciones, index=None, placeholder="Elegir…", key=llave, label_visibility="collapsed",
+                        on_change=aplicar_clasificacion, args=(tabla, llave, [f["id"]], llave_nota))
+    boton_ver_mas(llave_pag, n, len(filas), 20)
+
+
+def pantalla_pendientes():
+    cats, cuentas, egresos, ingresos = leer_pendientes()
+    de_egreso = {c["nombre"]: c["id"] for c in cats if c["flujo"] == "egreso" and c.get("activa", True) and c["nombre"] not in CATEGORIAS_DE_ESPERA}
+    de_ingreso = {c["nombre"]: c["id"] for c in cats if c["flujo"] == "ingreso" and c.get("activa", True) and c["nombre"] not in CATEGORIAS_DE_ESPERA}
+    st.session_state.mapa_categorias = {"egresos": de_egreso, "ingresos": de_ingreso}
+    opciones_egreso = sorted(de_egreso) + [NO_ES_GASTO]
+    opciones_ingreso = sorted(de_ingreso) + [NO_ES_INGRESO]
+    id_transferencia = next((c["id"] for c in cats if c["flujo"] == "egreso" and c["nombre"] == "Transferencia enviada"), None)
+
+    if st.session_state.get("aviso"):
+        st.error(st.session_state.pop("aviso"))
+    if st.session_state.get("hecho"):
+        st.success(st.session_state.pop("hecho"))
+
+    marcados_e = [e for e in egresos if e.get("revision")]
+    marcados_i = [i for i in ingresos if i.get("revision")]
+    egresos = [e for e in egresos if not e.get("revision")]
+    ingresos = [i for i in ingresos if not i.get("revision")]
+    compras = [e for e in egresos if e.get("categoria_id") != id_transferencia]
+    transferencias = [e for e in egresos if e.get("categoria_id") == id_transferencia]
+
+    st.caption(
+        f"Compras: {len(compras)} (Gs {gs(sum(e['importe'] for e in compras))}) · "
+        f"Transferencias enviadas: {len(transferencias)} (Gs {gs(sum(e['importe'] for e in transferencias))}) · "
+        f"Ingresos: {len(ingresos)} (Gs {gs(sum(i['importe'] for i in ingresos))})"
+    )
+    vista = st.segmented_control(
+        "Qué clasificar", ["Compras", "Transferencias enviadas", "Ingresos", "Marcados", "Corregir"],
+        default="Compras", key="vista_pendientes", label_visibility="collapsed",
+    ) or "Compras"
+
+    if vista == "Compras":
+        if not compras:
+            st.success("No quedan compras sin clasificar.")
+            return
+        grupos = {}
+        for e in compras:
+            grupos.setdefault(clave_comercio(e.get("texto_extracto")), []).append(e)
+        orden = sorted(grupos.items(), key=lambda kv: -sum(e["importe"] for e in kv[1]))
+        st.caption(f"{len(orden)} comercio(s), de mayor a menor. La categoría elegida se aplica a todas las compras del comercio.")
+        n = ver_mas("pag_compras", len(orden), 15)
+        for clave, movs in orden[:n]:
+            with st.container(border=True):
+                fechas = sorted(str(m["fecha_operacion"]) for m in movs)
+                periodo = fecha_corta(fechas[0]) if len(movs) == 1 else f"{fecha_corta(fechas[0])} a {fecha_corta(fechas[-1])}"
+                st.markdown(f"**{clave}** · {len(movs)} compra(s) · Gs {gs(sum(m['importe'] for m in movs))}")
+                st.caption(f"{periodo} · {cuentas.get(movs[0]['cuenta_id'], '')}")
+                llave = f"cat_g_{clave}"
+                st.selectbox("Categoría", opciones_egreso, index=None, placeholder="Elegir categoría…", key=llave,
+                             label_visibility="collapsed", on_change=aplicar_clasificacion,
+                             args=("egresos", llave, [m["id"] for m in movs]))
+                if len(movs) > 1:
+                    with st.expander("Ver las compras"):
+                        st.dataframe(
+                            [{"Fecha": fecha_corta(m["fecha_operacion"]), "Importe": gs(m["importe"]), "Detalle": m.get("texto_extracto") or ""}
+                             for m in sorted(movs, key=lambda m: str(m["fecha_operacion"]))],
+                            hide_index=True, width="stretch")
+        boton_ver_mas("pag_compras", n, len(orden), 15)
+
+    elif vista == "Transferencias enviadas":
+        if not transferencias:
+            st.success("No quedan transferencias sin clasificar.")
+            return
+        st.caption("El banco no informa el destinatario: hay que resolverlas de a una. La nota es opcional y ayuda a recordar.")
+        lista_uno_por_uno("egresos", transferencias, cuentas, opciones_egreso, "fecha_operacion", "t")
+
+    elif vista == "Ingresos":
+        if not ingresos:
+            st.success("No quedan ingresos por identificar.")
+            return
+        lista_uno_por_uno("ingresos", ingresos, cuentas, opciones_ingreso, "fecha_cobro", "i")
+
+    elif vista == "Marcados":
+        if not (marcados_e or marcados_i):
+            st.info("No hay movimientos marcados como «no es un gasto» o «no es un ingreso».")
+            return
+        st.caption("Siguen contando en los totales hasta que se corrijan en el sistema de la carpeta y se vuelva a cargar el ledger.")
+        for tabla, filas, campo in (("egresos", marcados_e, "fecha_operacion"), ("ingresos", marcados_i, "fecha_cobro")):
+            if not filas:
+                continue
+            st.markdown("**No son gasto**" if tabla == "egresos" else "**No son ingreso**")
+            for f in sorted(filas, key=lambda f: -f["importe"]):
+                a, b = st.columns([4, 1])
+                nota = f" — {f['notas']}" if f.get("notas") else ""
+                a.write(f"Gs {gs(f['importe'])} · {fecha_corta(f[campo])} · {f.get('texto_extracto') or ''}{nota}")
+                b.button("Deshacer", key=f"des_{tabla}_{f['id']}", on_click=deshacer_marca, args=(tabla, f["id"]))
+
+    else:  # Corregir
+        st.caption("Cambia la categoría de un gasto ya clasificado. Buscá por el nombre del comercio.")
+        texto = st.text_input("Buscar", key="buscar_corregir", placeholder="Por ejemplo: farmacia", label_visibility="collapsed").strip()
+        if len(texto) < 3:
+            st.info("Escribí al menos tres letras.")
+            return
+        patron = "%" + re.sub(r"[%,()*]", " ", texto) + "%"
+        filas = pedir(lambda: cliente.table("egresos").select("id,fecha_operacion,importe,texto_extracto,categoria_id")
+                      .eq("estado", "clasificado").ilike("texto_extracto", patron).order("fecha_operacion", desc=True).limit(30).execute().data)
+        if not filas:
+            st.info("Sin resultados.")
+            return
+        nombre_de = {v: k for k, v in de_egreso.items()}
+        lista = sorted(de_egreso)
+        st.caption(f"{len(filas)} resultado(s) (se muestran hasta 30, los más recientes).")
+        for f in filas:
+            a, b = st.columns([3, 2])
+            a.write(f"{fecha_corta(f['fecha_operacion'])} · Gs {gs(f['importe'])} · {f.get('texto_extracto') or ''}")
+            actual = nombre_de.get(f.get("categoria_id"))
+            llave = f"cor_{f['id']}"
+            b.selectbox("Categoría", lista, index=lista.index(actual) if actual in lista else None, key=llave,
+                        label_visibility="collapsed", on_change=aplicar_clasificacion, args=("egresos", llave, [f["id"]]))
+
+
 def pantalla_resumen():
     filas = pedir(lambda: cliente.table("v_resultado_mensual").select("*").order("mes").execute().data)
     if not filas:
@@ -475,6 +683,7 @@ if rol in ("admin", "familia"):
 PANTALLAS["Lista de compras"] = pantalla_lista
 if rol in ("admin", "familia"):
     PANTALLAS["Revisar artículos"] = pantalla_revisar
+    PANTALLAS["Pendientes"] = pantalla_pendientes
     PANTALLAS["Resumen del año"] = pantalla_resumen
 if rol == "admin":
     PANTALLAS["Importar"] = pantalla_importar
