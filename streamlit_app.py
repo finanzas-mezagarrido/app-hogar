@@ -7,14 +7,18 @@ Stock del hogar
   - Lista de compras: lo decidido, a la vista de todos.
   - Revisar artículos: aprobar lo que se propuso desde la pantalla de stock.
 Finanzas
+  - Margen del mes: cuánto queda de cada partida del presupuesto (tope − cuotas viejas
+    de la Amex − gastado), con semáforo; registro rápido de gastos en efectivo.
   - Pendientes: clasificar gastos e identificar ingresos que el sistema no reconoció.
   - Resumen del año: ingreso, gasto y ahorro por mes, con el gasto por grupo.
   - Importar: carga el ledger del sistema de la carpeta Finanzas (solo administrador).
   - Estado: control de conexión y de tablas (solo administrador).
 Qué ve cada persona lo decide la base de datos según su rol, no esta pantalla.
 """
+import calendar
 import datetime as dt
 import re
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -535,6 +539,249 @@ def pantalla_pendientes():
                         label_visibility="collapsed", on_change=aplicar_clasificacion, args=("egresos", llave, [f["id"]]))
 
 
+# ----------------------------------------------------------------------------
+# Margen del mes: presupuesto por partida contra lo gastado
+# ----------------------------------------------------------------------------
+ZONA = ZoneInfo("America/Asuncion")
+MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+            "septiembre", "octubre", "noviembre", "diciembre"]
+COLOR = {"verde": "🟢", "naranja": "🟠", "rojo": "🔴"}
+
+
+def hoy() -> dt.date:
+    return dt.datetime.now(ZONA).date()
+
+
+def nombre_mes(m: dt.date) -> str:
+    return f"{MESES_ES[m.month - 1]} {m.year}"
+
+
+def avance_del_mes(mes: dt.date) -> float:
+    """Fracción del mes transcurrida: 1 si ya pasó, 0 si todavía no empezó."""
+    h = hoy()
+    if (h.year, h.month) > (mes.year, mes.month):
+        return 1.0
+    if (h.year, h.month) < (mes.year, mes.month):
+        return 0.0
+    dias = calendar.monthrange(mes.year, mes.month)[1]
+    return h.day / dias
+
+
+def semaforo(f: dict, avance: float) -> str:
+    """Verde: dentro del ritmo. Naranja: va más rápido que el mes. Rojo: pasado del tope."""
+    tope, cuotas, gastado, consumo = f["tope"], f["cuotas"], f["gastado"], f["consumo"]
+    if tope <= 0:
+        return "rojo" if consumo > 0 else "verde"
+    if consumo > tope:
+        return "rojo"
+    if f["bloque"] == "Fijo":
+        return "verde"
+    libre = tope - cuotas
+    if avance == 0:
+        return "verde"
+    if gastado > libre * avance + 0.10 * tope or (consumo > 0.9 * tope and avance < 0.85):
+        return "naranja"
+    return "verde"
+
+
+def leer_margen(mes: dt.date):
+    filas = pedir(lambda: cliente.rpc("margen_mes", {"p_mes": mes.isoformat()}).execute().data) or []
+    ing = pedir(lambda: cliente.table("presupuesto_ingreso").select("ingreso_ordinario,nota")
+                .eq("mes", mes.isoformat()).execute().data)
+    return filas, (ing[0] if ing else None)
+
+
+def meses_con_presupuesto():
+    filas = pedir(lambda: cliente.table("presupuesto_ingreso").select("mes").order("mes").execute().data) or []
+    return [dt.date.fromisoformat(f["mes"][:10]) for f in filas]
+
+
+def elegir_mes(meses):
+    h = hoy().replace(day=1)
+    por_defecto = h if h in meses else next((m for m in meses if m >= h), meses[-1])
+    return st.selectbox("Mes", meses, index=meses.index(por_defecto), format_func=nombre_mes,
+                        key="margen_mes", label_visibility="collapsed")
+
+
+def vista_margen(mes: dt.date):
+    filas, ingreso = leer_margen(mes)
+    if not filas:
+        st.info("No hay presupuesto cargado para este mes.")
+        return
+    avance = avance_del_mes(mes)
+    ingreso_ord = ingreso["ingreso_ordinario"] if ingreso else 0
+    gasto_proyectado = sum(max(f["tope"], f["consumo"]) for f in filas)
+    resultado = ingreso_ord - gasto_proyectado
+    excedido = sum(max(0, f["consumo"] - f["tope"]) for f in filas)
+    consumido = sum(f["consumo"] for f in filas)
+    total_tope = sum(f["tope"] for f in filas)
+
+    estado = "🟢" if resultado >= 0 else "🔴"
+    st.markdown(f"### {estado} Resultado proyectado: Gs {gs(resultado)}")
+    a, b = st.columns(2)
+    a.metric("Ingreso ordinario", gs(ingreso_ord))
+    b.metric("Gasto proyectado", gs(gasto_proyectado),
+             delta=f"+{gs(excedido)} sobre los topes" if excedido else "dentro de los topes",
+             delta_color="inverse" if excedido else "off")
+    st.progress(min(1.0, consumido / total_tope) if total_tope else 0.0,
+                text=f"Usado {gs(consumido)} de {gs(total_tope)} · mes transcurrido {round(avance * 100)} %")
+    st.caption(
+        "Proyección = ingreso ordinario − lo que es mayor en cada partida: su tope o lo ya usado. "
+        "Cuenta solo las cuentas cargadas (fondo común): no incluye lo que Sofía paga desde sus cuentas."
+    )
+
+    por_bloque = {}
+    for f in filas:
+        por_bloque.setdefault(f["bloque"], []).append(f)
+    for bloque in ("Variable", "Discrecional", "Fijo", "Sin identificar"):
+        items = por_bloque.get(bloque, [])
+        if not items:
+            continue
+        disp = sum(f["disponible"] for f in items)
+        rojos = sum(1 for f in items if semaforo(f, avance) == "rojo")
+        titulo = f"**{bloque}** · disponible Gs {gs(disp)}" + (f" · {rojos} 🔴" if rojos else "")
+        with st.expander(titulo, expanded=bloque in ("Variable", "Discrecional")):
+            for f in items:
+                color = COLOR[semaforo(f, avance)]
+                partes = [f"tope {gs(f['tope'])}"]
+                if f["cuotas"]:
+                    partes.append(f"cuotas viejas {gs(f['cuotas'])}")
+                partes.append(f"gastado {gs(f['gastado'])}")
+                st.markdown(f"{color} **{f['partida']}**  \nDisponible **Gs {gs(f['disponible'])}** · " + " · ".join(partes))
+    with st.expander("Cómo se lee"):
+        st.markdown(
+            "- **Disponible** = tope − cuotas viejas de la Amex del mes − gastado en el mes.\n"
+            "- 🟢 dentro del ritmo del mes · 🟠 va más rápido que el mes · 🔴 pasado del tope.\n"
+            "- En los gastos fijos solo cuenta si se pasaron del tope.\n"
+            "- Las cuotas viejas son las de la Amex anteriores al presupuesto, por mes de vencimiento del resumen. "
+            "El seguro de cancelación de deuda es estimado desde enero.\n"
+            "- Los retiros de cajero que no se detallen con «Registrar» cuentan en «Sin clasificar y transferencias enviadas»."
+        )
+    datos_hasta()
+
+
+def datos_hasta():
+    filas = pedir(lambda: cliente.table("v_datos_hasta").select("*").execute().data) or []
+    usadas = [f for f in filas if f["codigo"] not in ("efectivo",) and f["ultimo_movimiento"]]
+    if not usadas:
+        return
+    usadas.sort(key=lambda f: f["ultimo_movimiento"], reverse=True)
+    texto = " · ".join(f"{f['nombre']}: {fecha_corta(f['ultimo_movimiento'])}" for f in usadas[:6])
+    st.caption(f"Datos hasta — {texto}. Lo posterior todavía no está cargado.")
+
+
+def vista_registrar(mes: dt.date):
+    partidas = pedir(lambda: cliente.table("presupuesto_partidas").select("id,nombre,bloque,orden")
+                     .eq("activa", True).order("orden").execute().data) or []
+    if st.session_state.get("hecho_margen"):
+        st.success(st.session_state.pop("hecho_margen"))
+    st.caption("Para gastos en efectivo. Lo pagado con tarjeta o transferencia llega solo desde el banco: no hace falta cargarlo.")
+    with st.form("registro_rapido", clear_on_submit=True):
+        importe = st.number_input("Importe (Gs)", min_value=0, step=1000, value=0)
+        ids = {p["nombre"]: p["id"] for p in partidas}
+        nombre = st.selectbox("Partida", list(ids), index=None, placeholder="Elegir partida…")
+        detalle = st.text_input("Detalle", placeholder="Por ejemplo: feria, propina, peaje")
+        fecha = st.date_input("Fecha", value=hoy(), max_value=hoy(), format="DD/MM/YYYY")
+        if st.form_submit_button("Registrar", type="primary", width="stretch"):
+            if importe <= 0 or not nombre:
+                st.error("Falta el importe o la partida.")
+            else:
+                try:
+                    pedir(lambda: cliente.rpc("registrar_gasto", {
+                        "p_fecha": fecha.isoformat(), "p_importe": int(importe), "p_partida": ids[nombre],
+                        "p_detalle": detalle, "p_cuenta": "efectivo"}).execute())
+                    st.session_state.hecho_margen = f"Registrado: Gs {gs(importe)} en {nombre}."
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"No se pudo registrar ({type(e).__name__}). Probá de nuevo.")
+
+    recientes = pedir(lambda: cliente.table("v_gastos_presupuesto").select("id,fecha,importe,texto_extracto,partida_id")
+                      .eq("origen", "manual").order("fecha", desc=True).limit(10).execute().data) or []
+    if recientes:
+        nombres = {p["id"]: p["nombre"] for p in partidas}
+        st.markdown("**Últimos registros en efectivo**")
+        for r in recientes:
+            a, b = st.columns([4, 1])
+            a.write(f"{fecha_corta(r['fecha'])} · Gs {gs(r['importe'])} · {nombres.get(r['partida_id'], '')}"
+                    + (f" · {r['texto_extracto']}" if r.get("texto_extracto") else ""))
+            if b.button("Borrar", key=f"borrar_{r['id']}"):
+                try:
+                    n = pedir(lambda: cliente.rpc("borrar_gasto_manual", {"p_id": r["id"]}).execute().data)
+                    st.session_state.hecho_margen = "Registro borrado." if n else "Solo se pueden borrar registros de los últimos 7 días."
+                except Exception as e:  # noqa: BLE001
+                    st.session_state.hecho_margen = f"No se pudo borrar ({type(e).__name__})."
+                st.rerun()
+
+
+def al_cambiar_partida(mov_id: int, mapa: dict):
+    elegido = st.session_state.get(f"part_{mov_id}")
+    try:
+        pedir(lambda: cliente.rpc("asignar_partida", {"p_ids": [mov_id], "p_partida": mapa.get(elegido)}).execute())
+    except Exception as e:  # noqa: BLE001
+        st.session_state.aviso = f"No se pudo cambiar la partida ({type(e).__name__})."
+
+
+def vista_movimientos(mes: dt.date):
+    partidas = pedir(lambda: cliente.table("presupuesto_partidas").select("id,nombre,orden")
+                     .eq("activa", True).order("orden").execute().data) or []
+    nombres = {p["id"]: p["nombre"] for p in partidas}
+    mapa = {p["nombre"]: p["id"] for p in partidas}
+    if st.session_state.get("aviso"):
+        st.error(st.session_state.pop("aviso"))
+    movs = pedir(lambda: cliente.table("v_gastos_presupuesto")
+                 .select("id,fecha,importe,texto_extracto,cuenta_nombre,partida_id,es_cuota_heredada,es_retiro")
+                 .eq("mes", mes.isoformat()).order("fecha", desc=True).execute().data) or []
+    movs = [m for m in movs if not m["es_cuota_heredada"]]
+    filtro = st.selectbox("Partida", ["Todas"] + [p["nombre"] for p in partidas], key="filtro_movs",
+                          label_visibility="collapsed")
+    if filtro != "Todas":
+        movs = [m for m in movs if nombres.get(m["partida_id"]) == filtro]
+    if not movs:
+        st.info("No hay gastos cargados en este mes para esa partida.")
+    else:
+        st.caption(f"{len(movs)} gasto(s) · Gs {gs(sum(m['importe'] for m in movs))}. Si alguno está en la partida equivocada, cambiala acá.")
+        n = ver_mas(f"pag_movs_{mes}_{filtro}", len(movs), 25)
+        lista = [p["nombre"] for p in partidas]
+        for m in movs[:n]:
+            with st.container(border=True):
+                st.markdown(f"**Gs {gs(m['importe'])}** · {fecha_corta(m['fecha'])} · {m['cuenta_nombre']}")
+                st.caption(m.get("texto_extracto") or "Sin descripción")
+                if m["es_retiro"]:
+                    st.caption("Retiro de cajero: lo que no se detalle con «Registrar» cuenta como sin clasificar.")
+                    continue
+                actual = nombres.get(m["partida_id"])
+                st.session_state[f"part_{m['id']}"] = actual
+                st.selectbox("Partida", lista, key=f"part_{m['id']}", label_visibility="collapsed",
+                             on_change=al_cambiar_partida, args=(m["id"], mapa))
+        boton_ver_mas(f"pag_movs_{mes}_{filtro}", n, len(movs), 25)
+
+    cuotas = pedir(lambda: cliente.table("cuotas_heredadas").select("partida_id,comercio,cuota,importe,estimado")
+                   .eq("mes", mes.isoformat()).execute().data) or []
+    if cuotas:
+        with st.expander(f"Cuotas viejas de la Amex en {nombre_mes(mes)} · Gs {gs(sum(c['importe'] for c in cuotas))}"):
+            st.dataframe(
+                [{"Partida": nombres.get(c["partida_id"], ""), "Comercio": c["comercio"], "Cuota": c["cuota"] or "",
+                  "Importe": gs(c["importe"]), "": "estimado" if c["estimado"] else ""}
+                 for c in sorted(cuotas, key=lambda c: (nombres.get(c["partida_id"], ""), -c["importe"]))],
+                hide_index=True, width="stretch")
+
+
+def pantalla_margen():
+    meses = meses_con_presupuesto()
+    if not meses:
+        st.info("Todavía no hay presupuesto cargado.")
+        return
+    mes = elegir_mes(meses)
+    vista = st.segmented_control("Vista", ["Margen", "Registrar", "Movimientos"], default="Margen",
+                                 key="vista_margen", label_visibility="collapsed") or "Margen"
+    if vista == "Margen":
+        vista_margen(mes)
+    elif vista == "Registrar":
+        vista_registrar(mes)
+    else:
+        vista_movimientos(mes)
+
+
 def pantalla_resumen():
     filas = pedir(lambda: cliente.table("v_resultado_mensual").select("*").order("mes").execute().data)
     if not filas:
@@ -677,7 +924,10 @@ def pantalla_estado():
 
 
 # ---------------------------------------------------------------- navegación
-PANTALLAS = {"Stock": pantalla_stock}
+PANTALLAS = {}
+if rol in ("admin", "familia"):
+    PANTALLAS["Margen del mes"] = pantalla_margen
+PANTALLAS["Stock"] = pantalla_stock
 if rol in ("admin", "familia"):
     PANTALLAS["Faltantes"] = pantalla_faltantes
 PANTALLAS["Lista de compras"] = pantalla_lista
@@ -690,8 +940,8 @@ if rol == "admin":
     PANTALLAS["Estado"] = pantalla_estado
 
 st.title("Hogar")
-seccion = st.segmented_control("Sección", list(PANTALLAS), default="Stock", key="seccion", label_visibility="collapsed")
-seccion = seccion or "Stock"
+seccion = st.segmented_control("Sección", list(PANTALLAS), default=list(PANTALLAS)[0], key="seccion", label_visibility="collapsed")
+seccion = seccion or list(PANTALLAS)[0]
 
 PANTALLAS[seccion]()
 
